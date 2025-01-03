@@ -1,12 +1,36 @@
 import time
-import threading
-import queue
 import os
 import json
 from pathlib import Path
 from openai import AzureOpenAI, APIError, RateLimitError, APITimeoutError
 from tenacity import retry, stop_after_attempt, wait_exponential
 from dotenv import load_dotenv
+import logging
+import sys
+import select
+import math
+from termcolor import colored
+
+class ColoredFormatter(logging.Formatter):
+    def format(self, record):
+        if record.levelno == logging.INFO:
+            if "User input" in record.msg:
+                record.msg = colored(record.msg, 'green')
+            elif "Response" in record.msg:
+                record.msg = colored(record.msg, 'blue')
+            elif "Self-reflection" in record.msg:
+                record.msg = colored(record.msg, 'yellow')
+        elif record.levelno == logging.ERROR:
+            record.msg = colored(record.msg, 'red')
+        return super().format(record)
+
+# Setup logging with colors
+handler = logging.StreamHandler()
+handler.setFormatter(ColoredFormatter('%(asctime)s - %(message)s', 
+                                   datefmt='%H:%M:%S'))
+logger = logging.getLogger(__name__)
+logger.setLevel(logging.DEBUG)
+logger.handlers = [handler]
 
 # Load environment variables from .env file
 env_path = Path(__file__).parent.parent / '.env'
@@ -58,6 +82,7 @@ class LLM:
     @internal_state.setter
     def internal_state(self, value):
         """Set the internal state of the LLM."""
+        logger.debug(f"State change: {self._internal_state} -> {value}")
         self._internal_state = value
 
     def process_message(self, message):
@@ -67,11 +92,13 @@ class LLM:
 
     def handle_error(self, error):
         self._internal_state = "error"
+        logger.error(f"Error: {str(error)}")
         # ...existing error handling...
 
     def _validate_and_init_state(self, initial_state):
         if initial_state and not self.conversation_history:
             if not isinstance(initial_state, str):
+                logger.error("Invalid initial state type")
                 raise ValueError("Initial state must be a string")
             self.conversation_history.append({
                 "role": "system",
@@ -148,23 +175,38 @@ class LLM:
         except Exception as e:
             print(f"Error summarizing conversation: {e}")
 
+    def summarize_conversation(self):
+        try:
+            response = self._get_summary()
+            summary = response.choices[0].message.content.strip()
+            logger.info("Conversation summarized: %s", summary)
+            self.conversation_history = [
+                self.conversation_history[0],  # Keep system message
+                {"role": "system", "content": f"Previous conversation summary: {summary}"}
+            ]
+        except Exception as e:
+            logger.error("Error summarizing conversation: %s", str(e))
+
     def save_history(self):
         """Save conversation history to JSON file"""
         try:
             with open(self.save_path, 'w', encoding='utf-8') as f:
                 json.dump(self.conversation_history, f, ensure_ascii=False, indent=2)
+                logger.info("Conversation history saved to %s", self.save_path)
         except Exception as e:
-            print(f"Error saving conversation history: {e}")
+            logger.error("Error saving conversation history: %s", str(e))
 
     def load_history(self):
         """Load conversation history from JSON file"""
         try:
             if self.save_path.exists():
                 with open(self.save_path, 'r', encoding='utf-8') as f:
-                    return json.load(f)
+                    history = json.load(f)
+                    logger.info("Loaded conversation history from %s", self.save_path)
+                    return history
         except Exception as e:
-            print(f"Error loading conversation history: {e}")
-        return None
+            logger.error("Error loading conversation history: %s", str(e))
+            return None
 
     def _count_tokens(self, conversation_history):
         """Estimate token count - adjust based on your tokenizer"""
@@ -182,49 +224,59 @@ class LLM:
         self.save_history()
 
 class ConversationManager:
-    def __init__(self, llm, reflection_rate=1):  # reflections per second
+    def __init__(self, llm, initial_reflection_rate=1):
         self.llm = llm
-        self.reflection_rate = reflection_rate
-        self.external_input_queue = queue.Queue()
         self.running = True
+        self.last_reflection_time = 0
+        self.last_user_interaction = time.time()
+        self.initial_reflection_rate = initial_reflection_rate
+        self.max_interval = 3600  # 1 hour in seconds
 
     def start_internal_reflection(self):
         while self.running:
-            try:
-                # Check for external input (non-blocking)
-                external_input = self.external_input_queue.get_nowait()
-                print("\nExternal interruption:", external_input)
-                self.llm.generate_response(external_input) #process the external input
-            except queue.Empty:
-                pass  # No external input
+            current_time = time.time()
+            
+            # Check stdin for user input
+            if select.select([sys.stdin], [], [], 0.0)[0]:
+                user_input = sys.stdin.readline().strip()
+                if user_input:
+                    self.last_user_interaction = current_time
+                    logger.info("User input: %s", user_input)
+                    response = self.llm.generate_response(user_input)
+                    logger.info("Response: %s", response)
+                    continue
 
-            internal_prompt = f"Reflect on previous thought: {self.llm.internal_state}"
-            print("\nInternal thought:", internal_prompt)
-            self.llm.generate_response(internal_prompt)
-            time.sleep(1 / self.reflection_rate)  # Control the rate
+            # Calculate dynamic reflection rate
+            time_since_interaction = current_time - self.last_user_interaction
+            interval = min(
+                self.max_interval,
+                (1.0 / self.initial_reflection_rate) * math.pow(2, time_since_interaction / 60)
+            )
+            reflection_rate = 1.0 / interval
 
-    def receive_external_input(self, input_text):
-        self.external_input_queue.put(input_text)
+            # Self-reflection with backoff
+            if current_time - self.last_reflection_time >= interval:
+                internal_prompt = f"Reflect on your purpose and the user input: {self.llm.internal_state}"
+                response = self.llm.generate_response(internal_prompt)
+                logger.info("Self-reflection (%.1f sec interval): %s", interval, response)
+                self.last_reflection_time = current_time
+
+            time.sleep(0.1)
 
     def stop(self):
         self.running = False
 
-# Example usage (make sure to set environment variables)
-my_llm = LLM(initial_state="I am starting to think.")
-conversation_manager = ConversationManager(my_llm, reflection_rate=1)
-
-reflection_thread = threading.Thread(target=conversation_manager.start_internal_reflection)
-reflection_thread.daemon = True
-reflection_thread.start()
-
-time.sleep(3)
-conversation_manager.receive_external_input("What is your opinion on AI safety?")
-time.sleep(5)
-conversation_manager.receive_external_input("How do you feel right now?")
-
-time.sleep(3)
-conversation_manager.stop()
-reflection_thread.join(timeout=1)
-
-print("\nFinal internal state: " + my_llm.internal_state)
-print("Program finished.")
+if __name__ == "__main__":
+    try:
+        my_llm = LLM(initial_state="Ready!")
+        conversation_manager = ConversationManager(my_llm, initial_reflection_rate=1)
+        
+        logger.info("Starting continuous reflection loop. Press CTRL+C to exit.")
+        conversation_manager.start_internal_reflection()
+    
+    except KeyboardInterrupt:
+        logger.info("Shutting down gracefully...")
+        conversation_manager.running = False
+    except Exception as e:
+        logger.error("Unexpected error: %s", str(e))
+        raise
