@@ -131,4 +131,6 @@ dmypy.json
 .pytype/
 
 # Cython debug symbols
-cython_debug/.env
+cython_debug/
+
+conversation_history.json
